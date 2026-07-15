@@ -463,7 +463,7 @@ The synthesizer receives all step results and produces a coherent final answer:
 - Handle partial failures (some steps returned "not found")
 - Write the final answer to **both** `final_answer` **and** the `messages` channel as an `AIMessage`
 
-> **Why append to `messages`?** Your deployed endpoint (Part 2) exposes an OpenAI-compatible chat API. MLflow serves the graph with a *messages-in → messages-out* contract: the request arrives as `{"messages": [...]}` and the response is read from the **last message** in the returned state. If the synthesizer only sets `final_answer` and never appends an `AIMessage`, the endpoint will return an empty completion even though your local state looks correct. Keep `messages` (with the `add_messages` reducer) as the entry and exit channel; the extra fields (`plan`, `step_results`, …) are internal scratch space.
+> **Why append to `messages`?** Your deployed endpoint (Part 2) is served with a *messages-in → messages-out* contract: the request arrives as `{"messages": [...]}` and the answer is read from the **last message** in the returned state. If the synthesizer only sets `final_answer` and never appends an `AIMessage`, the endpoint will return an empty answer even though your local state looks correct. Keep `messages` (with the `add_messages` reducer) as the entry and exit channel; the extra fields (`plan`, `step_results`, …) are internal scratch space. (Whether that state comes back as raw JSON or a proper OpenAI `ChatCompletion` depends on your model interface — see Task 2.4.)
 
 ---
 
@@ -515,6 +515,8 @@ graph = builder.compile()
 **Goal:** Package your Document Analyst as an MLflow model and deploy it to a Databricks Model Serving endpoint.
 
 **Reference:** `databricks_deployment_v1/` — study `agent.py` and `deployment.ipynb` thoroughly before starting.
+
+> **Model interface — two accepted approaches.** The simplest is `mlflow.langchain.log_model` on your bare graph (v1 style); its endpoint returns **raw LangGraph state** (see Task 2.4 for how to read it). Alternatively you may wrap the graph as a `mlflow.pyfunc.ChatModel` / `ChatAgent` (v2 style, see `databricks_deployment_v2/`), which returns a standard OpenAI `ChatCompletion` and plugs into the AI Playground / evaluation / Review App. Both are fine for PA4 — just parse whichever response shape you produce.
 
 > **See [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md) for complete details** on the manual
 > deployment path — the mental model, the five PA4-specific differences, the serving
@@ -652,23 +654,29 @@ databricks serving-endpoints get <your-endpoint-name>
 **Notebook work (pa4.ipynb):**
 
 1. Call the endpoint using `curl` and show the raw response
-2. Call the endpoint using the OpenAI Python SDK and show the parsed response
+2. Call the endpoint and show the parsed answer — **the response shape depends on how you logged the model** (see the note below)
 3. Run the same 3 test queries from Task 1.7 against the deployed endpoint
 4. Compare local vs. deployed responses — are they identical? If not, explain why
 5. Measure and report: latency per request (cold start vs. warm)
 
+> **Two valid response shapes.** If you logged with `mlflow.langchain.log_model` (like `databricks_deployment_v1`), the endpoint returns **raw LangGraph state as a batch list** — parse it as `data[0]["messages"][-1]["content"]` via a direct `requests.post` to `/invocations`. The OpenAI SDK's `resp.choices[0]...` will raise `'list' object has no attribute 'choices'` on this path. If instead you wrapped your graph as a `mlflow.pyfunc.ChatModel` / `ChatAgent` (like `databricks_deployment_v2`), you get a proper OpenAI `ChatCompletion` and `resp.choices[0].message.content` works. Either is accepted — just parse the shape you actually return. See `DEPLOYMENT_GUIDE.md` §7 for both code snippets.
+
 ```python
+# Path A — raw LangGraph state (mlflow.langchain.log_model, matches v1):
+import requests
+url = f"{DATABRICKS_HOST}/serving-endpoints/<your-endpoint-name>/invocations"
+r = requests.post(url, headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+                  json={"messages": [{"role": "user", "content": "What was the net income in 2023?"}]})
+print(r.json()[0]["messages"][-1]["content"])
+
+# Path B — OpenAI ChatCompletion (mlflow.pyfunc.ChatModel / ChatAgent, matches v2):
 import openai
-
-client = openai.OpenAI(
-    api_key=DATABRICKS_TOKEN,
-    base_url=f"{DATABRICKS_HOST}/serving-endpoints",
-)
-
-response = client.chat.completions.create(
+client = openai.OpenAI(api_key=DATABRICKS_TOKEN, base_url=f"{DATABRICKS_HOST}/serving-endpoints")
+resp = client.chat.completions.create(
     model="<your-endpoint-name>",
     messages=[{"role": "user", "content": "What was the net income in 2023?"}],
 )
+print(resp.choices[0].message.content)
 ```
 
 ---
@@ -999,6 +1007,7 @@ Most Part 2/3 time is lost to a handful of failure modes. Check here first.
 | Endpoint status `DEPLOYMENT_FAILED` right after creation | A required env var is missing, so `deployment/agent_model.py` raises at import time | Validate env vars at import (Task 2.1) so serving logs name the missing var; confirm every var from Task 2.3 is set |
 | Endpoint stuck in `NOT_READY` for a long time | First-time container build + model load, or the Vector Search endpoint/index isn't `READY` yet | Wait several minutes; verify the VS index from Task 0.3 is `READY` before serving |
 | Endpoint returns HTTP 200 but an **empty** completion | Synthesizer set `final_answer` but never appended an `AIMessage` to `messages` | Write the answer to the `messages` channel too (Task 1.6) — MLflow reads the last message |
+| `'list' object has no attribute 'choices'` from the OpenAI SDK | You logged with `mlflow.langchain.log_model` (raw-state path) but parsed with `resp.choices[...]` | Either read raw state via `requests` as `data[0]["messages"][-1]["content"]`, or log as a `ChatModel`/`ChatAgent` to get an OpenAI object (Task 2.4) |
 | `401 Unauthorized` from the container | `DATABRICKS_TOKEN` / `DATABRICKS_HOST` not passed, or a secret-scope reference is wrong | Store them in a secret scope and reference as `{{secrets/scope/key}}` (Task 2.3) |
 | `rag/store.py` raises at container startup | `VECTOR_SEARCH_ENDPOINT` / `VECTOR_SEARCH_INDEX` / `EMBEDDINGS_ENDPOINT` not set on the endpoint | Add them to `environment_vars` (plaintext is fine — not secrets) |
 | Works locally, fails when deployed | You referenced local-only state (a laptop DB, a local file path) | Everything must be reachable from the container: use the managed VS index and env-based config (Task 2.1) |

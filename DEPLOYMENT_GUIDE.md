@@ -147,12 +147,12 @@ tools = load_mcp_tools(_mcp_server)
 
 ---
 
-## 5. Difference #5 — Make the endpoint OpenAI-compatible
+## 5. Difference #5 — Return a non-empty answer on the `messages` channel
 
 databricks_deployment_v1 used `MessagesState`, so the assistant node automatically put its reply on the
-`messages` channel — and the endpoint returned it as a normal chat completion. Your
+`messages` channel — and the endpoint returned that state with the answer in it. Your
 PA4 `AnalystState` has extra fields (`plan`, `step_results`, `final_answer`). If your
-**synthesizer** only sets `final_answer`, the endpoint returns an *empty* completion.
+**synthesizer** only sets `final_answer`, the endpoint returns an *empty* answer.
 
 Fix (this is also why Task 1.6 insists on it):
 
@@ -163,6 +163,12 @@ return {"final_answer": answer, "messages": [AIMessage(content=answer)]}
 
 Rule of thumb: **messages in → messages out.** Keep `messages` (with `add_messages`) as
 the entry and exit channel; the other fields are internal scratch space.
+
+> **Note — this does *not* make the response OpenAI-shaped.** With Path A
+> (`mlflow.langchain.log_model`) the endpoint still returns **raw LangGraph state** as a
+> batch list; appending the `AIMessage` just guarantees that state contains your answer.
+> To get an actual OpenAI `ChatCompletion` object back, use Path B (a `ChatModel`/`ChatAgent`
+> interface) — see §7 Testing.
 
 ---
 
@@ -195,16 +201,34 @@ environment_vars={
 }
 ```
 
-**Testing** — same OpenAI SDK call. One correction: the databricks_deployment_v1 notebook's last cell
-had a bug (`response[0].messages[-1]`). Use the standard OpenAI shape:
+**Testing** — how you read the response depends on **which model interface you logged**. There are two valid paths, and they return different shapes:
+
+**Path A — `mlflow.langchain.log_model` on your bare graph (matches databricks_deployment_v1).**
+The endpoint serves your graph as a generic model: `predict()` returns **raw LangGraph state**, and Databricks wraps it as a **one-element batch list** — *not* an OpenAI `ChatCompletion`. The OpenAI SDK cannot parse that into a `.choices` object (you'll get `'list' object has no attribute 'choices'`), so call the `/invocations` route directly and read the state:
+
+```python
+import requests
+url = f"{DATABRICKS_HOST}/serving-endpoints/<your-endpoint-name>/invocations"
+resp = requests.post(url, headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+                     json={"messages": [{"role": "user", "content": "What was the net income in 2023?"}]})
+data = resp.json()
+print(data[0]["messages"][-1]["content"])   # raw state → batch list → last message
+```
+
+This is exactly what `databricks_deployment_v1/streamlit_app.py` does (*"the endpoint returns raw LangGraph state, not OpenAI ChatCompletion format, so we call the REST API directly"*).
+
+**Path B — a chat-native interface: `mlflow.pyfunc.ChatModel` or `ChatAgent` (matches databricks_deployment_v2).**
+Wrapping your graph as a `ChatModel`/`ChatAgent` makes Databricks recognise it as a chat model and return a proper OpenAI `ChatCompletion` object, so the OpenAI SDK works directly:
 
 ```python
 resp = client.chat.completions.create(
     model="<your-endpoint-name>",
     messages=[{"role": "user", "content": "What was the net income in 2023?"}],
 )
-print(resp.choices[0].message.content)   # not response[0].messages[-1]
+print(resp.choices[0].message.content)      # proper OpenAI ChatCompletion
 ```
+
+Both paths are accepted. Path A is the smaller change from v1; Path B is what our `databricks_deployment_v2/` reference uses and is the cleaner production shape (it also plugs into the AI Playground, evaluation, and Review App out of the box). Whichever you pick, parse the shape it actually returns — don't mix the two.
 
 **Where you run it** — databricks_deployment_v1 ran the deploy cells in a Databricks notebook. In PA4 you
 may either run the same cells in `pa4.ipynb`, or run `deployment/deploy.py`. Both do the
@@ -235,6 +259,7 @@ Open **Serving → your endpoint → Logs** (same as databricks_deployment_v1) a
 | `Missing required environment variables` | secret scope not wired | check `environment_vars` secret refs |
 | `ModuleNotFoundError: 'databricks.vector_search'` | requirement not inferred | add it to `pip_requirements` |
 | endpoint READY but empty answers | synthesizer didn't append `AIMessage` | see §5 |
+| `'list' object has no attribute 'choices'` | parsed a raw-state (Path A) response with the OpenAI `.choices` shape | read `data[0]["messages"][-1]["content"]`, or log as a `ChatModel`/`ChatAgent` (Path B) — see §7 |
 | retrieval errors at inference | VS index/endpoint env vars missing | add `VECTOR_SEARCH_*` to `environment_vars` |
 
 You've done this loop before in databricks_deployment_v1 — read the traceback, fix the one line, re-log,
