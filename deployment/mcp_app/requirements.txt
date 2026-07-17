@@ -1,0 +1,7 @@
+# Databricks Apps installs this file into the app's own runtime environment before
+# running `command` from app.yaml. That runtime starts minimal -- it does NOT inherit
+# this repo's uv-managed environment -- so every import app.py needs (directly, or
+# transitively through tools/mcp_server.py) must be listed here explicitly.
+mcp>=1.0.0
+starlette>=0.37.0
+uvicorn>=0.30.0

@@ -44,6 +44,15 @@ def get_chat_llm(temperature: float = 0.0):
 
     We use the OpenAI-compatible surface (same as PA1–PA3) so the deployed
     endpoint speaks the same protocol the client SDK expects.
+
+    `timeout` is set explicitly: the underlying `openai` client otherwise defaults
+    to a 600s read timeout (confirmed via `openai.OpenAI().timeout`), so with none
+    set here, every LLM call made from any graph node (planner, supervisor,
+    rag_agent, mcp_tools, synthesizer) could block for up to 10 minutes if the
+    served model endpoint hangs. 60s matches the timeout Databricks' own SDK uses
+    by default for its REST calls (`databricks.sdk._base_client`) -- long enough
+    for a real completion, short enough to fail fast and let LangGraph/the caller
+    react instead of hanging silently.
     """
     from langchain_openai import ChatOpenAI
 
@@ -53,4 +62,5 @@ def get_chat_llm(temperature: float = 0.0):
         api_key=s["token"],
         base_url=f"{s['host']}/serving-endpoints",
         temperature=temperature,
+        timeout=60.0,
     )

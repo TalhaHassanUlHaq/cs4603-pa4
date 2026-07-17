@@ -15,6 +15,7 @@ env/
 # Databricks / notebooks
 .databricks/
 .ipynb_checkpoints/
+mlruns/
 
 # OS / editor
 .DS_Store

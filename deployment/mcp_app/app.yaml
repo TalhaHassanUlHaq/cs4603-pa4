@@ -1,0 +1,5 @@
+command: ["python", "deployment/mcp_app/app.py"]
+
+env:
+  - name: "MCP_SHARED_SECRET"
+    valueFrom: "mcp-shared-secret"

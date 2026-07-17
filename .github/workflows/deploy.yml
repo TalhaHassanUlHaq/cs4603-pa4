@@ -1,11 +1,7 @@
 # Bonus A — CI/CD pipeline (.github/workflows/deploy.yml)
 #
-# TODO: Implement a lint -> test -> deploy workflow.
-#   - lint:   ruff check on agent/ and client/
-#   - test:   a smoke test that imports and compiles the graph
-#   - deploy: ONLY on push to main; log the model, register a new UC version,
-#             and update the serving endpoint. Use GitHub Secrets for
-#             DATABRICKS_HOST / DATABRICKS_TOKEN. Add a workflow_dispatch trigger.
+# lint -> test -> deploy. Deploy only runs on push to main (never on PRs / feature
+# branches) and only after lint+test pass. See GITHUB_PIPELINE.md for the walkthrough.
 
 name: deploy
 
@@ -20,7 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO: install uv, sync deps, run `ruff check` and the smoke test
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check agent client
+
+      - name: Test (offline smoke test — no Databricks credentials needed)
+        run: uv run pytest -q
 
   deploy:
     needs: lint-and-test
@@ -28,4 +35,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO: install deps and run `python deployment/deploy.py` with secrets
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Log, register, and deploy the model
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_MODEL: ${{ secrets.DATABRICKS_MODEL }}
+          EMBEDDINGS_ENDPOINT: ${{ vars.EMBEDDINGS_ENDPOINT }}
+          UC_CATALOG: ${{ vars.UC_CATALOG }}
+          UC_SCHEMA: ${{ vars.UC_SCHEMA }}
+          VECTOR_SEARCH_ENDPOINT: ${{ vars.VECTOR_SEARCH_ENDPOINT }}
+          VECTOR_SEARCH_INDEX: ${{ vars.VECTOR_SEARCH_INDEX }}
+          SERVING_ENDPOINT_NAME: ${{ vars.SERVING_ENDPOINT_NAME }}
+          SECRET_SCOPE: ${{ vars.SECRET_SCOPE }}
+        run: uv run python deployment/deploy.py
+
+      - name: Print deployed endpoint status
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          uv run python -c "
+          import os
+          from databricks.sdk import WorkspaceClient
+          w = WorkspaceClient(host=os.environ['DATABRICKS_HOST'], token=os.environ['DATABRICKS_TOKEN'])
+          name = os.environ.get('SERVING_ENDPOINT_NAME', 'document-analyst')
+          ep = w.serving_endpoints.get(name)
+          print(f'Endpoint: {ep.name}')
+          print(f'State: {ep.state}')
+          for e in ep.config.served_entities or []:
+              print(f'Served entity: {e.entity_name} version {e.entity_version}')
+          "
