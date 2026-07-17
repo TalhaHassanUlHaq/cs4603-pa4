@@ -339,6 +339,49 @@ cross-platform MLflow path bug, and two client-side response-parsing bugs), each
 diagnosed from an actual failure — a real build log, a real service-log traceback,
 or a real live HTTP response — rather than guessed and patched speculatively.
 
+## Bonus A — CI/CD activation (two more real bugs, found by actually running it)
+
+`origin` for this repo (`alikhawaja/cs4603-pa4`) is the instructor's own repo — this
+account only has read access to it, so activating Bonus A meant forking to
+`TalhaHassanUlHaq/cs4603-pa4`, pushing this work there, configuring GitHub Secrets
+(`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_MODEL`) and Variables (the
+remaining non-secret config), and triggering `workflow_dispatch`.
+
+**Run 1** (`lint-and-test` ✅ in 16s; `deploy` job partially failed) surfaced two more
+genuine, previously-unexercised bugs — this pipeline had never actually run in a CI
+environment before:
+
+11. **`deploy.yml`'s "Print deployed endpoint status" step was missing
+    `SERVING_ENDPOINT_NAME` from its own `env:` block** (it only forwarded
+    `DATABRICKS_HOST`/`DATABRICKS_TOKEN`). `deployment/deploy.py` itself had already
+    logged model version 14 and issued the `update_config` call successfully — the
+    actual deploy worked — but the status-print step's
+    `os.environ.get('SERVING_ENDPOINT_NAME', 'document-analyst')` fell back to the
+    wrong default name and the job died on
+    `ResourceDoesNotExist: Endpoint with name 'document-analyst' does not exist`.
+    Fixed by adding `SERVING_ENDPOINT_NAME: ${{ vars.SERVING_ENDPOINT_NAME }}` to
+    that step's `env:` block.
+12. **`create_or_update_endpoint()`'s readiness loop only checked `state.ready`,
+    never `state.config_update`.** `state.ready` stays `READY` for the entire
+    duration of a rolling update, because the *previous* served-entity version keeps
+    answering traffic while the new one builds — exactly the zero-downtime rollout
+    behavior described in this document's own Task 2.3 analysis answer #2. That
+    means the loop's `if state.ready == READY: break` fired immediately on the very
+    first poll (the old version was already `READY`), so `deploy.py` printed the
+    endpoint URL and exited declaring success while version 14 was still
+    `config_update=IN_PROGRESS` and the endpoint was still actually serving version
+    12 — confirmed directly by querying the endpoint right after the "successful"
+    run. Fixed by requiring **both** `state.ready == READY` **and**
+    `state.config_update == EndpointStateConfigUpdate.NOT_UPDATING` before the loop
+    breaks, so the function only reports success once the new version has actually
+    finished rolling out.
+
+Both fixes are in `deployment/deploy.py` and `.github/workflows/deploy.yml`; the
+full offline test suite (19/19) and `ruff` stayed clean after each. This is the same
+pattern as the ten Part 2 bugs above: a class of bug (silently reporting success
+based on a rolling-update-stable field) that inspection alone would not have caught
+and that only running the real pipeline against a real endpoint surfaced.
+
 ## Design decisions
 
 - **Three-tier supervisor routing** (`agent/supervisor.py`): try
