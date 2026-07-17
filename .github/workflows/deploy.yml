@@ -60,6 +60,7 @@ jobs:
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          SERVING_ENDPOINT_NAME: ${{ vars.SERVING_ENDPOINT_NAME }}
         run: |
           uv run python -c "
           import os

@@ -223,7 +223,17 @@ def create_or_update_endpoint(uc_name: str, version: str) -> str:
     while time.monotonic() < deadline:
         status = w.serving_endpoints.get(endpoint_name)
         state = status.state
-        if state and state.ready == EndpointStateReady.READY:
+        # `state.ready` alone is not enough: during a rolling update the endpoint
+        # reports READY the whole time because the *previous* served-entity version
+        # keeps answering traffic (confirmed live -- see STUDENT_ANALYSIS.md/
+        # COMPLETION_GUIDE.md bug log), while `state.config_update` is what actually
+        # tracks whether the new version has finished rolling out. Both must hold
+        # before this function can truthfully report the new version is serving.
+        if (
+            state
+            and state.ready == EndpointStateReady.READY
+            and state.config_update == EndpointStateConfigUpdate.NOT_UPDATING
+        ):
             break
         if state and state.config_update in _FAILED_STATES:
             raise RuntimeError(
