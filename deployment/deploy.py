@@ -112,8 +112,15 @@ def _model_name() -> str:
     ).replace("-", "_")
 
 
-def log_and_register() -> tuple[str, str]:
+def log_and_register(lc_model_path: str = AGENT_MODEL_PATH, signature=None) -> tuple[str, str]:
     """Log the model via MLflow models-from-code and register it in Unity Catalog.
+
+    `lc_model_path` defaults to `deployment/agent_model.py` (Part 2 / Bonus A). Bonus
+    B (`deployment/deploy_agents.py`) passes `deployment/agent_model_agents.py`
+    instead -- same graph, same code_paths, same registration, only the
+    models-from-code entry point differs, because `agents.deploy()` requires an
+    Agent-Framework-compatible output schema that the raw graph's AnalystState
+    output does not have (see `agent_model_agents.py`'s docstring).
 
     Returns (uc_full_name, version).
     """
@@ -135,7 +142,7 @@ def log_and_register() -> tuple[str, str]:
 
     with mlflow.start_run(run_name="document-analyst") as run:
         model_info = mlflow.langchain.log_model(
-            lc_model=AGENT_MODEL_PATH,
+            lc_model=lc_model_path,
             name="agent",
             code_paths=[
                 os.path.join(ROOT, "agent"),
@@ -145,6 +152,7 @@ def log_and_register() -> tuple[str, str]:
             ],
             conda_env=_conda_env(),
             input_example=INPUT_EXAMPLE,
+            signature=signature,
         )
         print(f"Logged model in run {run.info.run_id} -> {model_info.model_uri}")
 
@@ -171,7 +179,14 @@ def _secret_env_vars() -> dict[str, str]:
     mcp_url = os.environ.get("MCP_SERVER_URL", "")
     if mcp_url:
         env_vars["MCP_SERVER_URL"] = mcp_url
-        env_vars["MCP_SHARED_SECRET"] = f"{{{{secrets/{scope}/MCP_SHARED_SECRET}}}}"
+        env_vars["MCP_SHARED_SECRET"] = f"{{{{secrets/{scope}/mcp-shared-secret}}}}"
+        # OAuth client-credentials for the Databricks Apps platform gate in front of
+        # the remote MCP server -- see agent/graph.py::_fetch_mcp_oauth_token().
+        # MCP_SHARED_SECRET alone isn't enough to reach the app at all: Databricks
+        # Apps require a genuine OAuth bearer token before a request reaches the
+        # app's own code, confirmed live.
+        env_vars["MCP_APP_CLIENT_ID"] = f"{{{{secrets/{scope}/mcp-app-client-id}}}}"
+        env_vars["MCP_APP_CLIENT_SECRET"] = f"{{{{secrets/{scope}/mcp-app-client-secret}}}}"
     return env_vars
 
 

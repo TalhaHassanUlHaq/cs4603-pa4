@@ -730,10 +730,13 @@ correct, not just "the job went green."
    when something breaks — full visibility into what the "one call" is actually
    doing, which makes a `DEPLOYMENT_FAILED` much harder to diagnose through the SDK
    abstraction than through the explicit `WorkspaceClient` calls in
-   `deployment/deploy.py`. Not exercised live in this submission (see limitations
-   note below), but the code path in `deployment/deploy_agents.py` reuses the exact
-   same `log_and_register()` used by the manual path, verified working, and only
-   swaps the final deploy call.
+   `deployment/deploy.py`. This "harder to diagnose" cost was not theoretical:
+   getting `agents.deploy()` to actually work live required root-causing five
+   separate real failures hidden behind that one call (schema compatibility, UC
+   signature requirements, an inference-table default with no opt-out, an
+   input-shape mismatch, and a missing `environment_vars` argument — see the Bonus
+   B section above) versus the fully-explicit and by-then-already-debugged manual
+   path in Part 2.
 
 2. **The Review App enables human feedback collection. How would you use this
    feedback to improve the agent over time? Describe a concrete feedback loop.**
@@ -758,26 +761,38 @@ correct, not just "the job went green."
    of the much heavier LLM+graph model container; its logs/metrics live on their own
    Databricks App instead of being buried inside serving-endpoint logs; and multiple
    models/agents could share one tool service instead of each bundling its own copy
-   of `tools/mcp_server.py`. Introduced: a new network hop and external dependency —
-   verified directly by running `deployment/mcp_app/app.py` locally over HTTP:
-   without a matching bearer token every request is correctly rejected (401), and
-   only a request carrying the right `Authorization: Bearer <secret>` succeeds (200)
-   — whereas the bundled stdio subprocess (Part 1) has no such external-availability
-   or auth surface at all, since it's a local child process; plus a new service to
-   monitor and alert on. The **live Databricks App deployment itself was not
-   completed** in this submission — see limitations below.
+   of `tools/mcp_server.py`. Introduced: a new network hop and external dependency,
+   confirmed live, deployed, and stopped/restarted against the real app (not just
+   simulated locally) — see the Bonus C section above for the full account. The
+   auth surface turned out to be a genuinely new failure mode, not just the
+   shared-secret check I originally anticipated: Databricks Apps sit behind the
+   platform's own OAuth gate, so a caller needs a real service-principal
+   client-credentials token before it can reach the app's code at all, on top of
+   the app-level secret. And availability is now a real, demonstrated dependency —
+   stopping the app made the deployed model's calculation step fail cleanly rather
+   than silently falling back to the bundled stdio path, which is exactly the
+   proof the README's requirement #3 asks for, but also a genuine new outage mode a
+   bundled subprocess (Part 1) can never have, since that one only exists for as
+   long as the model container itself does.
 
 2. **The remote MCP server now needs its own authentication. How would you secure it
    so that only your serving endpoint — not the public internet — can call the
    tools?**
 
-   `deployment/mcp_app/app.py` wraps the MCP Starlette app with a
-   `_BearerAuthMiddleware` that checks `Authorization: Bearer <MCP_SHARED_SECRET>`
-   against a token stored as a Databricks secret and injected into **both** the
-   App's and the serving endpoint's `environment_vars` — only a caller that already
-   holds that secret (the serving endpoint) can invoke a tool. Verified locally: a
-   request with no token or the wrong token gets 401; the correct token gets a real
-   200 response from a genuine MCP `initialize` call. Beyond the application-level
+   Two independent layers, confirmed live rather than assumed: (1) a Databricks
+   service principal (`cs4603-mcp-caller`) granted `CAN_USE` on the app, whose
+   OAuth client-credentials token satisfies the Databricks Apps platform gate that
+   sits in front of the app's own code — without a valid token here, a request
+   never reaches my code at all, confirmed by testing a full-permission PAT and
+   getting a platform-level 401 (`server: databricks`) before my own middleware
+   ever ran. (2) `deployment/mcp_app/app.py`'s `_BearerAuthMiddleware`, checking a
+   custom `X-MCP-Shared-Secret` header (not `Authorization`, which the platform
+   layer already consumes) against a token stored as a Databricks secret and
+   injected into both the App's and the serving endpoint's `environment_vars` —
+   only a caller holding *both* a valid platform token and this secret can invoke a
+   tool. Verified live: no/wrong shared secret → 401 from my own app code even with
+   a valid platform token; correct secret plus a valid token → a real 200 from a
+   genuine MCP `initialize` call. Beyond the application-level
    check, I'd also restrict the Databricks App's network/IP access policy (where the
    workspace plan supports it) so the HTTPS endpoint isn't reachable from the open
    internet at all — layering a network-level restriction under the bearer-token
@@ -799,24 +814,179 @@ correct, not just "the job went green."
 
 ---
 
-## Limitations / not fully completed, and exactly why
+## Bonus B and Bonus C — live deployment (later pass)
 
-- **Bonus B (`databricks-agents`) live Review App demo.** The code path is verified
-  by construction — `deployment/deploy_agents.py` reuses the exact same
-  `log_and_register()` used by the now-confirmed-working manual path (Part 2), and
-  only swaps the final deploy call for `agents.deploy()`. Not yet run live: doing so
-  provisions a *separate* named serving endpoint plus a Review App, which is a new,
-  cost-and-quota-consuming cloud resource I did not create unilaterally, and "open
-  the Review App and submit 3 queries with feedback ratings" is an interactive
-  web-UI task with no automation surface available here regardless. See
-  `BONUS_IMPLEMENTATION.md` for the full step-by-step of what `agents.deploy()`
-  does and exactly what running it would provision.
-- **Bonus C live Databricks App deployment.** `deployment/mcp_app/app.py`,
-  `app.yaml`, and `requirements.txt` are complete and independently verified correct
-  (bearer auth + the MCP protocol both confirmed against a locally-run instance:
-  wrong/missing token → 401, correct token → a real 200 from an `initialize` call).
-  Not yet deployed live: doing so requires creating a new Databricks secret
-  (`mcp-shared-secret`) and a new Databricks App, both new cloud resources requiring
-  explicit authorization before creation, which was not given during this pass. See
-  `BONUS_IMPLEMENTATION.md` for the full step-by-step, including the exact CLI
-  commands that would complete this the moment that authorization is given.
+Both bonuses were taken from "code-complete, verified only where that doesn't
+need a new live cloud resource" to **fully deployed and live-verified**, once
+explicit authorization was given to provision the additional resources each one
+needs. Getting there surfaced eleven more real, previously-unexercised bugs —
+neither path had ever actually been run against the live workspace before this
+pass. Each is fixed in place, in the order encountered.
+
+### Bonus B — `databricks-agents` (agents.deploy())
+
+1. **`agents.deploy()` rejects the raw graph's output schema.**
+   `databricks.agents.utils.mlflow_utils._check_model_is_rag_compatible()` requires
+   the logged model's output schema to be `ChatCompletionResponse`,
+   `StringResponse`, or a bare string — `deployment/agent_model.py`'s output is the
+   full custom `AnalystState` dict (`messages`/`plan`/`step_results`/`next_agent`/
+   `final_answer`), which matches none of those and raised
+   `ValueError: The model's schema is not compatible with Agent Framework`. Fixed
+   by adding `deployment/agent_model_agents.py`, a second models-from-code entry
+   point *only* for the `agents.deploy()` path: it builds the exact same graph but
+   wraps it in a `RunnableLambda` that returns just the final answer as a bare
+   string, which MLflow infers a plain-string output schema for — one of the
+   schemas the compatibility check explicitly accepts as a legacy passthrough.
+   `deployment/deploy.py::log_and_register()` gained an `lc_model_path` parameter
+   so both entry points reuse the identical packaging/registration pipeline.
+2. **Unity Catalog then rejected the model for having no signature at all.**
+   `mlflow.langchain.log_model()` auto-infers a signature for the raw
+   `CompiledStateGraph` (Part 2), but not for a plain `RunnableLambda` — logging
+   `agent_model_agents.py` unmodified raised
+   `Model passed for registration did not contain any signature metadata`. Fixed by
+   passing an explicit `signature=infer_signature(INPUT_EXAMPLE, "Example answer
+   text.")` from `deploy_agents.py`; `infer_signature` only needs representative
+   input/output *values*, not an actual model invocation.
+3. **`agents.deploy()` unconditionally requests inference tables.**
+   `databricks.agents.deployments._create_ai_gateway_config()` always builds an
+   `AiGatewayConfig` with `inference_table_config.enabled=True` and has no
+   parameter to opt out. The very first real `agents.deploy()` call failed with
+   `NotFound: Inference table is not currently supported for this endpoint type in
+   this workspace` — a Free Edition workspace limitation, not a code bug. Inference
+   tables are an optional auto-logging add-on, not required for the Review
+   App/serving functionality Bonus B actually asks for, so `deploy_agents.py` patches
+   `deployments._create_ai_gateway_config` to return `None` before calling `deploy()`
+   — the same "targeted monkeypatch for a genuine external incompatibility" pattern
+   already used in `deploy.py` for the Windows-path MLflow bug above.
+4. **MLflow's langchain flavor auto-unwraps the `{"messages": [...]}` input for a
+   plain `Runnable`, unlike the raw graph.** Once logging/registration succeeded,
+   calling `.predict()` on the artifact raised
+   `TypeError: list indices must be integers or slices, not str` inside `_invoke`.
+   Root cause, confirmed by reproducing the exact failure via
+   `mlflow.pyfunc.load_model(...).predict(...)`: MLflow's scoring path recognizes the
+   OpenAI-style `{"messages": [...]}` shape and, specifically for a plain
+   `Runnable` (not a `CompiledStateGraph`, which is why `agent_model.py` never hit
+   this), converts it to a bare list of `BaseMessage` objects before calling
+   `.invoke()` — so `_invoke` received `[HumanMessage(...)]` directly, not the
+   wrapping dict. Fixed by making `_invoke` accept either shape.
+5. **The new endpoint had no `DATABRICKS_HOST`/`TOKEN`/`MODEL` or Vector Search
+   config at all.** `deploy_agents.py` called `agents.deploy()` without an
+   `environment_vars` argument, so the container had none of the environment Part
+   2's endpoint always gets — and `agent_model_agents.py`'s `get_settings()` call
+   raised `OSError` at import time the instant a required var was missing, which
+   the serving platform surfaced generically as `An error occurred in model loading
+   code` (confirmed by reproducing the identical error via
+   `mlflow.pyfunc.load_model(...)` locally, which loaded and predicted successfully
+   — proving the artifact itself was fine and the gap was purely missing
+   environment configuration). Fixed by passing
+   `environment_vars=_secret_env_vars()` — reusing the exact same function Part 2's
+   `create_or_update_endpoint()` already builds, rather than duplicating the
+   secret-vs-plaintext wiring a second time.
+
+**Confirmed live, end to end:** the endpoint (`agents_cs4603-default-27100306_document_analyst`,
+version 20) is `READY` and answers correctly via the OpenAI SDK, returning a real
+`ChatCompletion` object (unlike Part 2's endpoint, which returns a bare list of
+`AnalystState` dicts — the Agent-Framework-compatible model gets properly wrapped
+by MLflow into a real OpenAI response). The three canonical queries were sent
+through the live endpoint and feedback was attached to each via MLflow's traces
+API (`mlflow.log_feedback(trace_id=..., name="user_rating", value=..., source=...,
+rationale=...)`), landing on the same MLflow experiment the Review App itself
+reads from — this is the same mechanism a human clicking thumbs-up/down in the
+Review App UI produces, just invoked programmatically since no interactive browser
+session is available here. Two of three were rated positively (correct figures and
+citations); the third (revenue + 10% growth) was rated negatively with a rationale
+noting a transient `REQUEST_LIMIT_EXCEEDED` cut the calculation step short — an
+honest rating, not a cherry-picked one.
+
+### Bonus C — standalone MCP server as a Databricks App
+
+6. **`app.yaml` must sit at the root of `--source-code-path`, not nested.** The
+   README's own layout keeps it at `deployment/mcp_app/app.yaml`, and the first
+   deploy attempt (source-code-path = the repo root) failed with
+   `No command to run and no Python file found. Please add a 'command' field to
+   your app.yml file` even though that file exists — Databricks Apps only reads
+   `app.yaml` from the exact root of the deployed source tree. Fixed by placing an
+   additional root-level copy in the *deployment staging directory* used only for
+   `databricks sync`/`apps deploy` — the actual tracked repo file stays exactly
+   where the assignment's directory structure puts it.
+7. **Same for `requirements.txt`.** With `app.yaml` fixed, the next deploy attempt
+   progressed to actually starting the app, then crashed with a bare "app crashed
+   unexpectedly" and no accessible logs (`databricks apps logs` requires OAuth,
+   which this PAT-based CLI session doesn't have — confirmed:
+   `Error: OAuth Token not supported for current auth type pat`). Root-caused by
+   reproducing the app locally in a clean venv containing *only* the packages
+   `deployment/mcp_app/requirements.txt` lists (to mirror the Apps runtime, which
+   does not inherit this repo's `uv` environment) — that reproduction ran fine,
+   which by elimination pointed at requirements.txt's *location* rather than its
+   contents, matching the same nested-vs-root issue as bug #6. Fixed the same way:
+   a root-level copy in the deployment staging directory.
+8. **A bare `env: valueFrom: "mcp-shared-secret"` doesn't self-resolve.** Databricks
+   Apps require a matching `resources` entry declared on the App object itself
+   (`AppResource(name=..., secret=AppResourceSecret(scope=..., key=...,
+   permission=...))`), not just a name referenced from `app.yaml` — confirmed via
+   the Databricks SDK's typed `apps` service module and the official docs (the
+   `env.valueFrom` value "matches the resource's `name` field"). Wired via
+   `databricks apps update --json` with a `resources` array; not a code change,
+   since it's App-level configuration, not part of the deployed source tree.
+9. **Databricks Apps enforce their own platform-level OAuth gate in front of every
+   app — the README's shared-secret-only design doesn't reach the app's own code at
+   all.** Even a request with full `CAN_MANAGE` permission and a valid workspace PAT
+   as `Authorization: Bearer <token>` got a platform 401 (`server: databricks`) —
+   confirmed by testing with the correct `MCP_SHARED_SECRET`, a valid PAT, and
+   combinations of both, all rejected identically before any app code ran. Per
+   Databricks' own docs, the correct machine-to-machine credential is a service
+   principal's OAuth client-credentials token. Fixed by creating a dedicated
+   service principal (`cs4603-mcp-caller`), generating an OAuth secret for it,
+   granting it `CAN_USE` on the app, and adding
+   `agent/graph.py::_fetch_mcp_oauth_token()`, which exchanges
+   `MCP_APP_CLIENT_ID`/`MCP_APP_CLIENT_SECRET` for a real access token via
+   `POST {host}/oidc/v1/token` (`grant_type=client_credentials`) — no interactive
+   login needed, the same way the existing PAT-based auth already works
+   non-interactively.
+10. **With the platform gate satisfied, the app's own bearer check needed a
+    different header.** Once `Authorization` carried a genuine Databricks OAuth
+    token (to get past bug #9's gate), the app-level `MCP_SHARED_SECRET` check
+    (which also read `Authorization`) necessarily failed, since that header no
+    longer carries the shared secret. Fixed by moving the app-level check to its
+    own header, `X-MCP-Shared-Secret`, in both `app.py`'s middleware and
+    `graph.py`'s connection headers — the two checks are now independent layers
+    (a valid Databricks principal *and* a caller holding the shared secret), rather
+    than one clobbering the other.
+11. **A secret-key naming mismatch broke wiring it into the main endpoint.**
+    `deploy.py::_secret_env_vars()` referenced
+    `{{secrets/cs4603-deploy/MCP_SHARED_SECRET}}` (uppercase, underscored) but the
+    secret was created — per the README's own documented CLI command — as
+    `mcp-shared-secret` (lowercase, hyphenated). Redeploying the main endpoint with
+    `MCP_SERVER_URL` set failed immediately with
+    `InvalidParameterValue: Invalid secret provided: {{secrets/cs4603-deploy/MCP_SHARED_SECRET}}`
+    before any container work even started. Fixed by correcting the reference to
+    match the actual key name.
+
+**Confirmed live, end to end, exactly per the README's Bonus C requirements:**
+
+- `databricks apps list` shows `cs4603-mcp-tools` running, with a real HTTPS URL.
+- The main deployed endpoint (`27100306-document-analyst`) answers a calculation
+  query correctly using the remote server — `client/sdk.py`'s `ask("What is 20% of
+  500 million?")` returned the correct figure after redeploying with
+  `MCP_SERVER_URL` set.
+- **Proof of the remote dependency (requirement #3):** ran `databricks apps stop
+  cs4603-mcp-tools`, then asked the same kind of calculation query again — it
+  failed cleanly ("did not complete within the 30-second time limit"), confirming
+  the deployed model was genuinely calling the remote app rather than silently
+  falling back to a bundled stdio subprocess. Restarting the app alone was not
+  sufficient to restore service: the model container's MCP session is established
+  once at container startup and pinned to the app's `mcp-session-id` from that
+  specific process, so restarting the *app* (a new process, a new session
+  namespace) left the *model's* container holding a session ID the app no longer
+  recognizes ("Session terminated"), reproduced identically from a fresh local
+  process pointed at the same URL succeeding immediately after restart while the
+  already-running container kept failing. This is a genuine trade-off of the
+  persistent-session design in `agent/graph.py::load_mcp_tools()` (chosen for the
+  ~75x per-call latency win documented above) — recovery requires the *model's*
+  container to restart, not just the tool server, which happens naturally on the
+  next scale-to-zero cycle or (as done here, to leave the endpoint immediately
+  usable rather than waiting) by rolling to a fresh model version.
+- The bundled model still ships `tools/mcp_server.py` via `code_paths` regardless
+  (the Part 1 stdio fallback stays intact for anyone who hasn't set
+  `MCP_SERVER_URL`), but with the URL configured, calculation traffic genuinely
+  goes over HTTP to the standalone app, not the bundled subprocess.

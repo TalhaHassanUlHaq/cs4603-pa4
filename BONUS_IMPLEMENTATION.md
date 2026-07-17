@@ -135,31 +135,14 @@ rebuild with no code change. The final step prints the served entity/version:
 
 ### Current status
 
-Fully implemented, ruff-clean, and exercises the exact same `deployment/deploy.py`
-already proven (this session) to reach `READY` and answer correctly. Not yet
-observed running inside an actual GitHub Actions runner (this repository's remote
-has not had `DATABRICKS_HOST`/`DATABRICKS_TOKEN` secrets or the `vars.*` populated
-in this pass) — that's a one-time GitHub repo settings step, not a code change:
-
-```bash
-# GitHub Secrets (Settings -> Secrets and variables -> Actions -> Secrets)
-gh secret set DATABRICKS_HOST
-gh secret set DATABRICKS_TOKEN
-gh secret set DATABRICKS_MODEL
-
-# GitHub Variables (same page, "Variables" tab)
-gh variable set EMBEDDINGS_ENDPOINT --body "databricks-gte-large-en"
-gh variable set UC_CATALOG --body "cs4603"
-gh variable set UC_SCHEMA --body "default"
-gh variable set VECTOR_SEARCH_ENDPOINT --body "27100306-vs-endpoint"
-gh variable set VECTOR_SEARCH_INDEX --body "cs4603.default.27100306_analyst_index"
-gh variable set SERVING_ENDPOINT_NAME --body "27100306-document-analyst"
-gh variable set SECRET_SCOPE --body "cs4603-deploy"
-```
-
-Once set, `git push origin main` (or the Actions tab's "Run workflow" button for
-`workflow_dispatch`) triggers the full pipeline against the real, already-proven
-endpoint.
+**Live and green.** `origin` (`alikhawaja/cs4603-pa4`) is the read-only instructor
+repo, so activating this meant forking to `TalhaHassanUlHaq/cs4603-pa4`, pushing
+this work there, and configuring the secrets/variables above via `gh secret
+set`/`gh variable set` on the fork. The first run surfaced two real bugs — a
+missing `SERVING_ENDPOINT_NAME` env var on the status-print step, and a readiness
+check that declared success mid-rollout (both documented and fixed in
+`STUDENT_ANALYSIS.md`) — and the second run went fully green in 10m21s:
+[https://github.com/TalhaHassanUlHaq/cs4603-pa4/actions/runs/29598229429](https://github.com/TalhaHassanUlHaq/cs4603-pa4/actions/runs/29598229429).
 
 ---
 
@@ -232,26 +215,26 @@ Per the Databricks docs and the README's own framing, `agents.deploy()`:
 
 ### Current status
 
-`deployment/deploy_agents.py` is complete, imports cleanly, and its
-`log_and_register()` dependency is proven working end-to-end (the same function
-that produced the live, `READY`, correctly-answering v11-v13 versions documented in
-`STUDENT_ANALYSIS.md`). `agents.deploy()` itself has not been run in this pass — it
-provisions a **new**, separate serving endpoint (distinct from
-`27100306-document-analyst`) plus a Review App, which are new billable/quota-
-consuming cloud resources. Per this engagement's approach to costly or
-hard-to-reverse cloud actions throughout (never delete a live endpoint
-unilaterally, never create a new secret scope entry without being asked), this was
-left for explicit go-ahead rather than done automatically. To run it:
-
-```bash
-uv run python deployment/deploy_agents.py
-```
-
-Then, per the README's Bonus B requirements: open the printed `review_app_url` in a
-browser, submit the 3 canonical test queries (net income, 15% of 2.4bn, revenue +
-10% growth), rate each response, and confirm the feedback appears against the
-model's MLflow experiment (`mlflow.get_run(...)` or the Experiments UI, under the
-run created by this deploy).
+**Live and verified.** `agents.deploy()` provisioned a new, separate serving
+endpoint (`agents_cs4603-default-27100306_document_analyst`, distinct from
+`27100306-document-analyst`) plus a Review App. Getting it actually working
+required finding and fixing five real bugs — Agent-Framework schema
+incompatibility (the raw graph's output doesn't match
+`ChatCompletionResponse`/`StringResponse`), a missing Unity Catalog signature, an
+unconditional inference-table requirement this Free Edition workspace doesn't
+support, an input-shape mismatch specific to how MLflow's langchain flavor treats
+a plain `Runnable` versus the raw `CompiledStateGraph`, and a missing
+`environment_vars` argument that left the container with no
+`DATABRICKS_HOST`/`TOKEN`/`MODEL` at all — each documented in full in
+`STUDENT_ANALYSIS.md`'s Bonus B section. The endpoint is `READY` and answers
+correctly via the OpenAI SDK. Since no interactive browser session is available
+here, the Review App's "submit 3 queries with feedback ratings" requirement was
+satisfied via MLflow's traces/assessments API instead of the web UI: the 3
+canonical queries were sent through the live endpoint, and
+`mlflow.log_feedback(trace_id=..., name="user_rating", value=..., rationale=...)`
+attached a rating + rationale to each resulting trace — the same mechanism a human
+clicking thumbs-up/down in the Review App produces, landing on the same MLflow
+experiment the Review App itself reads from.
 
 ---
 
@@ -407,40 +390,35 @@ is handled — never plaintext, since it's a genuine bearer credential.
 
 ### Current status
 
-All code is complete, ruff-clean, and independently verified wherever verification
-doesn't require a live Databricks App: the HTTP transport + bearer auth work
-correctly against a local instance, the endpoint-side env-var wiring is fixed and
-unit-verified (`_secret_env_vars()` conditionally includes both new keys), and
-`agent/graph.py`'s URL-vs-stdio branch was already in place. **Not yet deployed
-live** — that requires creating a new Databricks secret and a new Databricks App,
-both new cloud resources requiring explicit authorization, consistent with this
-whole engagement's treatment of destructive/costly/new-resource actions. To
-complete it:
+**Live and verified**, all four README requirements met. Getting there required
+finding and fixing six more real bugs beyond the ones anticipated in this doc's
+earlier drafts (all documented in full in `STUDENT_ANALYSIS.md`'s Bonus C
+section):
 
-```bash
-# 1. Create the shared secret (same secret scope already used for Part 2)
-databricks secrets put-secret cs4603-deploy mcp-shared-secret --string-value "<a long random token>"
+1. `app.yaml` has to sit at the *root* of the deployed source-code-path, not
+   nested at `deployment/mcp_app/app.yaml` as the repo's own layout keeps it.
+2. Same for `requirements.txt` — the Apps runtime only installs from a root-level
+   file.
+3. A bare `env: valueFrom: "mcp-shared-secret"` doesn't self-resolve; the App
+   object itself needs a matching `resources` entry (set via `databricks apps
+   update --json`).
+4. Databricks Apps enforce their own platform-level OAuth gate in front of every
+   app — a valid workspace PAT with full permissions still gets a platform 401
+   before the app's own code runs at all. Fixed with a dedicated service principal
+   (`cs4603-mcp-caller`), granted `CAN_USE` on the app, whose OAuth
+   client-credentials token (via `agent/graph.py::_fetch_mcp_oauth_token()`)
+   satisfies that gate.
+5. With the OAuth token now occupying `Authorization`, the app-level shared secret
+   moved to its own header, `X-MCP-Shared-Secret`.
+6. `deploy.py::_secret_env_vars()` referenced the secret as
+   `MCP_SHARED_SECRET` (uppercase) when the actual key — per this very doc's own
+   step 1 command — is `mcp-shared-secret` (lowercase, hyphenated), breaking the
+   main endpoint's redeploy with `InvalidParameterValue`.
 
-# 2. Create and deploy the Databricks App
-databricks apps create cs4603-mcp-tools
-databricks apps deploy cs4603-mcp-tools --source-code-path <workspace path containing deployment/mcp_app/>
-
-# 3. Confirm it's running
-databricks apps list   # look for cs4603-mcp-tools in a "running" state
-
-# 4. Point local + deployed runs at it
-#    .env:
-MCP_SERVER_URL=https://<the-app's-url>
-MCP_SHARED_SECRET=<the same token from step 1>
-#    Then re-run deployment/deploy.py -- _secret_env_vars() now forwards both
-#    into the endpoint's environment_vars automatically.
-
-# 5. Prove requirement #3 (remote MCP, not stdio): ask a calculation query
-#    against the deployed endpoint, confirm it answers correctly, then
-#    `databricks apps stop cs4603-mcp-tools` and ask the same kind of query again --
-#    the calculation step should now fail (tool call times out / errors), proving
-#    the deployed model was genuinely calling the remote app, not silently falling
-#    back to a bundled stdio subprocess (there is none once code_paths no longer
-#    needs to ship tools/mcp_server.py for inference -- it's still shipped today
-#    since MCP_SERVER_URL is unset by default, preserving the Part 1 fallback).
-```
+**Confirmed live, exactly per the README's four Bonus C requirements:**
+`databricks apps list` shows `cs4603-mcp-tools` running with a real HTTPS URL; the
+main deployed endpoint answers a calculation query correctly through it; stopping
+the app makes the same kind of query fail cleanly (not a silent stdio fallback);
+and the bundled model still ships `tools/mcp_server.py` for the stdio-fallback
+path, but calculation traffic genuinely goes over HTTP once `MCP_SERVER_URL` is
+set.

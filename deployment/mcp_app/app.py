@@ -27,12 +27,24 @@ _SHARED_SECRET = os.environ.get("MCP_SHARED_SECRET", "")
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Reject any request without a matching `Authorization: Bearer <secret>` header.
+    """Reject any request without a matching `X-MCP-Shared-Secret` header.
 
     A shared secret (stored as a Databricks secret, injected as MCP_SHARED_SECRET
     into both this App's and the serving endpoint's environment_vars) restricts
     callers to whoever holds the token -- in practice, only the serving endpoint --
     instead of leaving the calculation tools open to the public internet.
+
+    Checked in a custom header, not `Authorization`: Databricks Apps sit behind the
+    platform's own access proxy, which requires a valid Databricks OAuth bearer
+    token in `Authorization` before a request ever reaches this code at all --
+    confirmed live, a request with a shared-secret `Authorization: Bearer <token>`
+    but no valid Databricks auth gets a platform-level 401 (`server: databricks`)
+    that this middleware never even sees. So a real caller (the serving container)
+    needs a genuine Databricks OAuth token (via service-principal client-credentials
+    -- see `agent/graph.py::load_mcp_tools()`) in `Authorization` to get past the
+    platform gate, and the app-level shared secret has to live in a header of its
+    own to still provide a second, independent restriction beyond "any principal
+    with a Databricks OAuth token."
     """
 
     async def dispatch(self, request: Request, call_next):
@@ -41,7 +53,7 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
                 {"error": "server misconfigured: MCP_SHARED_SECRET not set"},
                 status_code=500,
             )
-        if request.headers.get("authorization") != f"Bearer {_SHARED_SECRET}":
+        if request.headers.get("x-mcp-shared-secret") != _SHARED_SECRET:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 

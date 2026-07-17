@@ -138,6 +138,34 @@ def _ensure_valid_mcp_stdio_errlog() -> None:
     target.__defaults__ = (open(os.devnull, "w"),)
 
 
+def _fetch_mcp_oauth_token() -> str:
+    """Exchange MCP_APP_CLIENT_ID/SECRET for a Databricks OAuth access token.
+
+    Databricks Apps sit behind the platform's own access proxy, which requires a
+    genuine Databricks OAuth bearer token in `Authorization` before a request ever
+    reaches the app's own code -- confirmed live: a request carrying only the
+    app-level MCP_SHARED_SECRET as `Authorization: Bearer <secret>` gets a
+    platform-level 401 (`server: databricks`, no app code involved at all). A
+    service principal (created for this purpose, granted CAN_USE on the App) can
+    get a real token via the standard OAuth client-credentials flow -- this needs
+    no browser/interactive login, unlike user-based OAuth, so it works from inside
+    the serving container exactly like the existing PAT-based auth does.
+    """
+    import httpx
+
+    host = os.environ["DATABRICKS_HOST"].rstrip("/")
+    client_id = os.environ["MCP_APP_CLIENT_ID"]
+    client_secret = os.environ["MCP_APP_CLIENT_SECRET"]
+    response = httpx.post(
+        f"{host}/oidc/v1/token",
+        auth=(client_id, client_secret),
+        data={"grant_type": "client_credentials", "scope": "all-apis"},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
 def load_mcp_tools(server_path: str | None = None):
     """Connect to the MCP tool server and return LangChain tool objects.
 
@@ -170,7 +198,8 @@ def load_mcp_tools(server_path: str | None = None):
                 "url": f"{mcp_url.rstrip('/')}/mcp",
                 "transport": "streamable_http",
                 "headers": {
-                    "Authorization": f"Bearer {os.environ.get('MCP_SHARED_SECRET', '')}"
+                    "Authorization": f"Bearer {_fetch_mcp_oauth_token()}",
+                    "X-MCP-Shared-Secret": os.environ.get("MCP_SHARED_SECRET", ""),
                 },
             }
         }
