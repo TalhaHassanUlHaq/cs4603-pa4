@@ -382,6 +382,20 @@ pattern as the ten Part 2 bugs above: a class of bug (silently reporting success
 based on a rolling-update-stable field) that inspection alone would not have caught
 and that only running the real pipeline against a real endpoint surfaced.
 
+**Run 2**, triggered after confirming the endpoint's in-flight v14 rollout had
+actually settled (to avoid a `ResourceConflict` from a second concurrent
+`update_config` call — the exact failure mode named in this document's Task 2.3
+analysis answer #2): **fully green**, both jobs, in 10m21s
+(`https://github.com/TalhaHassanUlHaq/cs4603-pa4/actions/runs/29598229429`). The
+`deploy` job's "Log, register, and deploy the model" step correctly took the full
+~10 minutes this time (proof the readiness-check fix is real: it now actually waits
+for the rollout instead of returning after the first poll), registered version 15,
+and "Print deployed endpoint status" correctly printed the live endpoint state.
+Confirmed directly afterward: `ready=READY`, `config_update=NOT_UPDATING`, serving
+entity version 15, and a fresh `DocumentAnalystClient.ask()` call against it
+returned a correct, cited answer — the CI-deployed version is genuinely live and
+correct, not just "the job went green."
+
 ## Design decisions
 
 - **Three-tier supervisor routing** (`agent/supervisor.py`): try
